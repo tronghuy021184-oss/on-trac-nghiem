@@ -738,10 +738,10 @@ async function ocrText(c){
 /* Bỏ cụm ký tự rác ở cuối dòng, sinh ra từ vệt bẩn hoặc bóng đổ */
 function tidy(l){
   const w=l.split(' ');let cut=false;
-  const ok=t=>/^[("“]?(?:\p{Lu}?[\p{Ll}]+|\p{Lu}|\d[\d.,]*%?)[.,:;?!…%)"”]*$/u.test(t);
+  const ok=t=>/^[("“]?(?:\p{L}\p{Ll}+|[A-H]|\d[\d.,]*%?)[.,:;?!…%)"”]*$/u.test(t);
   while(w.length>2){
     const t=w[w.length-1];
-    if((ok(t)&&t.replace(/P{L}/gu,'').length!==1)||(!cut&&/^\p{Lu}{2,6}[.,:;?!…)]*$/u.test(t)))break;
+    if(ok(t)||(!cut&&/^\p{Lu}{2,6}[.,:;?!…)]*$/u.test(t)))break;
     w.pop();cut=true;
   }
   return w.join(' ');
