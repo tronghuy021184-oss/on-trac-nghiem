@@ -690,18 +690,69 @@ async function ocrUpright(c){
   }
   return best;
 }
+/* Làm sạch ảnh: xóa nét bút màu khỏi chữ in, san phẳng bóng đổ. Giữ lại bản đồ mực để dò vòng khoanh. */
+function cleanPage(c){
+  const big=resized(c,2200,2),W=big.width,H=big.height,g=big.getContext('2d',{willReadFrequently:true});
+  const bgS=resized(big,70),bg=document.createElement('canvas');bg.width=W;bg.height=H;
+  const bgc=bg.getContext('2d',{willReadFrequently:true});bgc.imageSmoothingQuality='high';bgc.drawImage(bgS,0,0,W,H);
+  const im=g.getImageData(0,0,W,H),p=im.data,b=bgc.getImageData(0,0,W,H).data,ink=new Uint8Array(W*H);
+  for(let i=0,k=0;i<p.length;i+=4,k++){
+    const r=p[i],gr=p[i+1],bl=p[i+2],mx=Math.max(r,gr,bl),mn=Math.min(r,gr,bl);
+    const base=Math.max(40,(b[i]+b[i+1]+b[i+2])/3);
+    let v=(r*.3+gr*.59+bl*.11)/base*255;
+    if(mx-mn>28&&(bl-r>17||r-bl>28))ink[k]=1;
+    if(mx-mn>42&&(bl-r>26||r-bl>42))v=255;
+    v=v>=250?255:v<=30?0:(v-30)*255/220;
+    p[i]=p[i+1]=p[i+2]=v;
+  }
+  g.putImageData(im,0,0);
+  return{canvas:big,ink,W,H};
+}
+const INK_MIN=.012;
+function inkIn(ink,W,H,x0,y0,x1,y1){
+  x0=Math.max(0,x0|0);y0=Math.max(0,y0|0);x1=Math.min(W,x1|0);y1=Math.min(H,y1|0);
+  let n=0,t=0;for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){t++;n+=ink[y*W+x]}
+  return t?n/t:0;
+}
 async function ocrText(c){
   const w=await ocrWorker();
-  const {data}=await w.recognize(resized(c,2200,2),{}, {text:true});
-  return data.text;
+  const {canvas,ink,W,H}=cleanPage(c);
+  const {data}=await w.recognize(canvas,{}, {text:true,blocks:true});
+  const lines=(data.blocks||[]).flatMap(b=>b.paragraphs).flatMap(p=>p.lines).sort((a,b)=>a.bbox.y0-b.bbox.y0);
+  const out=[];let group=[];
+  const flush=()=>{const [best,next]=[...group].sort((a,b)=>b.ink-a.ink);if(best&&best.ink>=INK_MIN&&best.ink>=(next?.ink||0)*1.6)best.ws[best.i]='*'+best.ws[best.i];group=[]};
+  for(const l of lines){
+    const ws=l.words.map(x=>x.text.replace(/[*]/g,'').trim());
+    if(/^\W*c?âu$/iu.test(ws[0]||''))flush();
+    l.words.forEach((x,i)=>{
+      if(!/^[(\[{|]*[A-D][.,)\]}|:]*$/.test(ws[i])&&!/^[A-D][.,]\S/.test(ws[i]))return;
+      if(!(/[.,)]/.test(ws[i])||i===0))return;
+      const h=x.bbox.y1-x.bbox.y0,pad=h*.8,x0=x.bbox.x0;
+      group.push({ws,i,ink:inkIn(ink,W,H,x0-pad,x.bbox.y0-pad,x0+h+pad,x.bbox.y1+pad)});
+    });
+    out.push(ws.join(' '));
+  }
+  flush();
+  return out.join('\n');
+}
+/* Bỏ cụm ký tự rác ở cuối dòng, sinh ra từ vệt bẩn hoặc bóng đổ */
+function tidy(l){
+  const w=l.split(' ');let cut=false;
+  const ok=t=>/^[("“]?(?:\p{Lu}?[\p{Ll}]+|\p{Lu}|\d[\d.,]*%?)[.,:;?!…%)"”]*$/u.test(t);
+  while(w.length>2){
+    const t=w[w.length-1];
+    if((ok(t)&&t.replace(/P{L}/gu,'').length!==1)||(!cut&&/^\p{Lu}{2,6}[.,:;?!…)]*$/u.test(t)))break;
+    w.pop();cut=true;
+  }
+  return w.join(' ');
 }
 /* Vòng khoanh làm chữ cái bị đọc sai. Vì vậy chữ cái bị thiếu trong dãy A B C D chính là chỗ khoanh:
    điền lại chữ cái đó, và nếu chỉ thiếu đúng một chữ thì coi đó là đáp án. */
 function repairOcr(raw){
   const lines=String(raw).normalize('NFC').split('\n')
-    .map(l=>l.replace(/^[\s|!'"“”‘’\]\[¡.,:;]+(?=\S)/u,'').replace(/(^|\s)([A-D])[.,]\s*(?=\S)/g,'$1$2. ').trim()).filter(Boolean);
+    .map(l=>tidy(l.replace(/^[\s|!'"“”‘’\]\[¡.,:;]+(?=\S)/u,'').replace(/(^|\s)(\*?[A-D])[.,]\s*(?=\S)/g,'$1$2. ').trim())).filter(Boolean);
   const isQ=l=>/^\W*c?âu\s*\d/iu.test(l);
-  const marks=l=>[...l.matchAll(/(?:^|\s)([A-D])\.\s/g)].map(m=>({n:m[1].charCodeAt(0)-65,at:m.index+(m[0].startsWith(m[1])?0:1)}));
+  const marks=l=>[...l.matchAll(/(?:^|\s)\*?([A-D])\.\s/g)].map(m=>({n:m[1].charCodeAt(0)-65,at:m.index+m[0].search(/\S/)}));
   const junk=t=>/^[^\p{Ll}]{1,3}$/u.test(t);
   const fix=(l,n)=>{const w=l.split(' ');if(w.length>1&&junk(w[0]))w.shift();return L(n)+'. '+w.join(' ')};
   const out=[];
@@ -727,7 +778,7 @@ function repairOcr(raw){
         if(u===next-cur-1)for(let k=0;k<u;k++){g[i+k]=fix(g[i+k],cur+1+k);fills.push(i+k)}
         i=j;cur=next-1;
       }
-      if(fills.length===1)g[fills[0]]='*'+g[fills[0]];
+      if(fills.length===1&&!g.some(l=>/(?:^|\s)\*[A-D]\./.test(l)))g[fills[0]]='*'+g[fills[0]];
     }
     out.push(...g);s=e;
   }
