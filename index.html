@@ -376,8 +376,8 @@ function addQuestions(list,doc){for(const q of list)S.imp.questions.push({id:uid
 function loadScript(src){return new Promise((ok,no)=>{const s=document.createElement('script');s.src=src;s.onload=ok;s.onerror=()=>no(new Error('load'));document.head.append(s)})}
 let pdfReady;
 function pdfLib(){
-  const base='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
-  return pdfReady||=(async()=>{await loadScript(base+'pdf.min.js');await loadScript(base+'pdf.worker.min.js');pdfjsLib.GlobalWorkerOptions.workerSrc=base+'pdf.worker.min.js';return pdfjsLib})();
+  const base=STANDALONE?VENDOR:'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+  return pdfReady||=(async()=>{await loadScript(base+'pdf.min.js');await loadScript(base+'pdf.worker.min.js');pdfjsLib.GlobalWorkerOptions.workerSrc=base+'pdf.worker.min.js';return pdfjsLib})().catch(e=>{pdfReady=null;throw e});
 }
 function pageLines(items){
   const rows=[];
@@ -665,10 +665,14 @@ const SEED=[{
   "updatedAt": 1793892300000
 }
 ];
-const TESS='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+// Mọi thư viện nằm ngay trong thư mục vendor của trang, không phụ thuộc máy chủ ngoài
+const VENDOR=new URL('vendor/',location.href).href;
 let ocrW,ocrLog;
 async function ocrWorker(){
-  if(!ocrW){await loadScript(TESS);ocrW=await Tesseract.createWorker('vie+eng',1,{logger:m=>ocrLog?.(m)})}
+  if(!ocrW){
+    if(!window.Tesseract)await loadScript(VENDOR+'tesseract.min.js');
+    ocrW=await Tesseract.createWorker('vie',1,{workerPath:VENDOR+'worker.min.js',corePath:VENDOR.slice(0,-1),langPath:VENDOR.slice(0,-1),workerBlobURL:false,logger:m=>ocrLog?.(m),errorHandler:e=>console.error('ocr',e)});
+  }
   return ocrW;
 }
 function resized(c,long,maxUp=1){
@@ -688,8 +692,46 @@ async function ocrUpright(c){
 }
 async function ocrText(c){
   const w=await ocrWorker();
-  const {data}=await w.recognize(resized(c,2600,2.5),{}, {text:true});
+  const {data}=await w.recognize(resized(c,2200,2),{}, {text:true});
   return data.text;
+}
+/* Vòng khoanh làm chữ cái bị đọc sai. Vì vậy chữ cái bị thiếu trong dãy A B C D chính là chỗ khoanh:
+   điền lại chữ cái đó, và nếu chỉ thiếu đúng một chữ thì coi đó là đáp án. */
+function repairOcr(raw){
+  const lines=String(raw).normalize('NFC').split('\n')
+    .map(l=>l.replace(/^[\s|!'"“”‘’\]\[¡.,:;]+(?=\S)/u,'').replace(/(^|\s)([A-D])[.,]\s*(?=\S)/g,'$1$2. ').trim()).filter(Boolean);
+  const isQ=l=>/^\W*c?âu\s*\d/iu.test(l);
+  const marks=l=>[...l.matchAll(/(?:^|\s)([A-D])\.\s/g)].map(m=>({n:m[1].charCodeAt(0)-65,at:m.index+(m[0].startsWith(m[1])?0:1)}));
+  const junk=t=>/^[^\p{Ll}]{1,3}$/u.test(t);
+  const fix=(l,n)=>{const w=l.split(' ');if(w.length>1&&junk(w[0]))w.shift();return L(n)+'. '+w.join(' ')};
+  const out=[];
+  for(let s=0;s<lines.length;){
+    if(!isQ(lines[s])){out.push(lines[s++]);continue}
+    let e=s+1;while(e<lines.length&&!isQ(lines[e]))e++;
+    const g=lines.slice(s,e),info=g.map(marks),fills=[];
+    const f=info.findIndex((m,i)=>i>0&&m.length);
+    if(f>0){
+      let cur=-1;
+      const need=info[f][0].n;
+      if(need>0&&info[f][0].at>2){g[f]=fix(g[f],need-1);fills.push(f);info[f]=marks(g[f]);cur=need-2}      // chữ cái đầu dòng bị mất
+      else if(need===1&&f>1){g[f-1]=fix(g[f-1],0);fills.push(f-1)}                                          // dòng trước đó là phương án A
+      cur=info[f][info[f].length-1].n;
+      for(let i=f+1;i<g.length;){
+        if(info[i].length){
+          const n=info[i][0].n;
+          if(n>cur+1&&info[i][0].at>2){g[i]=fix(g[i],n-1);fills.push(i);info[i]=marks(g[i])}
+          cur=info[i][info[i].length-1].n;i++;continue;
+        }
+        let j=i;while(j<g.length&&!info[j].length)j++;
+        const next=j<g.length?info[j][0].n:4,u=j-i;
+        if(u===next-cur-1)for(let k=0;k<u;k++){g[i+k]=fix(g[i+k],cur+1+k);fills.push(i+k)}
+        i=j;cur=next-1;
+      }
+      if(fills.length===1)g[fills[0]]='*'+g[fills[0]];
+    }
+    out.push(...g);s=e;
+  }
+  return out.join('\n');
 }
 async function runOcr(b){
   const imp=S.imp;
@@ -698,7 +740,7 @@ async function runOcr(b){
   const c=await ocrUpright(await b.canvas());
   const t=await ocrText(c);
   imp.ocrText=imp.ocrText||{};imp.ocrText[b.doc]=(imp.ocrText[b.doc]||'')+'\n'+t;
-  const p=parseQuiz(imp.ocrText[b.doc]);
+  const p=parseQuiz(repairOcr(imp.ocrText[b.doc]));
   imp.questions=imp.questions.filter(q=>q.doc!==b.doc);
   addQuestions(p.questions,b.doc);Object.assign(imp.key,p.key);
 }
@@ -789,7 +831,7 @@ async function startImport(files){
         imp.queue.push({doc,label:g.map(x=>x.name).join(', '),text:'',make:async()=>(await Promise.all(g.map(photoImages))).flat()})}
     }else if(STANDALONE){
       for(const f of imgs)imp.queue.push({ocr:true,doc,label:f.name,canvas:()=>photoCanvas(f)});
-      imp.notes.push('Ảnh được đọc ngay trên máy nên chữ có thể sai dấu hoặc thiếu câu, và App không nhận ra vòng khoanh. Hãy sửa chữ theo đề gốc và tô đáp án đúng cho từng câu trước khi lưu.');
+      imp.notes.push('Ảnh được đọc ngay trên máy nên chữ có thể sai dấu hoặc thiếu câu, và App chỉ đoán được một phần các vòng khoanh. Hãy bấm Hiện đáp án, sửa chữ theo đề gốc và tô đáp án còn thiếu trước khi lưu.');
     }else imp.notes.push('Ảnh cần Claude đọc. Hãy mở App trên claude.ai khi đã đăng nhập, hoặc dán nội dung đề vào ô "Dán nội dung đề".');
   }
   imp.total=imp.queue.length;
@@ -859,7 +901,9 @@ async function runQueue(){
       mergeAI(b.doc,r);imp.queue.shift();imp.done++;applyKey();renderQList();
     }catch(e){
       if(e?.code==='cancelled'){imp.queue.length=0;imp.notes.push('Đã dừng. Các câu đọc được vẫn còn ở dưới.');break}
-      imp.err=AI_ERR[e?.code]||(b.ocr?'Không tải được bộ đọc chữ. Hãy kiểm tra mạng rồi bấm Đọc tiếp.':'Mất kết nối khi đọc đề. Bấm Đọc tiếp để thử lại phần còn lại.');break;
+      imp.err=AI_ERR[e?.code]||(b.ocr?`Chưa đọc được ${b.label}. Bấm Đọc tiếp để thử lại. Chi tiết lỗi: ${String(e?.message||e).slice(0,140)}`:'Mất kết nối khi đọc đề. Bấm Đọc tiếp để thử lại phần còn lại.');
+      if(b.ocr)ocrW=null; // lần Đọc tiếp sẽ khởi động lại bộ đọc
+      break;
     }
   }
   if(S.imp!==imp)return;
